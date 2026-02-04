@@ -1,0 +1,9 @@
+models/
+outputs/
+*.wav
+*.srt
+*.json
+*.txt
+*.pyc
+*.bin
+__pycache__/
