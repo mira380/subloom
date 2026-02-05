@@ -52,19 +52,21 @@ python subloom.py run "https://youtu.be/VIDEO_ID" --ollama
 
 ## Future Features
 
-- Optimize code and time needed to generate subtitles
+- Optimize code and time needed to generate subtitles ✅ (can be improved upon further)
 
-- Improve audio capturing (more reliable and doesn't randomly cut out and come back at times)
+- Improve audio capturing 🟡 (improve the engine or rewrite until its what i want)
 
-- Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear ️✅ (should be working)
+- Put in protections that prevents LLM from changing meaning/nuance and keeps original meaning clear ✅ (should be working)
 
-- Simplify usage of commands/program itself
+- Simplify usage of commands/program itself ❌ (not high priority currently)
 
-- Improve subtitle timing
+- Improve subtitle timing ⏳
 
-- Flag lines the model is unsure about
+- Flag lines the model is unsure about ⏳
 
-- Less clutter when outputting completed files ️✅ 1/2 (need to organize a little better)
+- Smarter LLM checks/intelligence upgrades ⏳
+
+- Less clutter when outputting completed files 🟡 (need to organize a little better)
 
 ### Target Goal
 
