@@ -141,7 +141,7 @@ class SrtItem:
     kotoba_text: str = ""
 
     # merge diagnostics (used for automatic Ollama gating + reports)
-    merge_decision: str = ""   # "replace" | "keep" | "insert"
+    merge_decision: str = ""  # "replace" | "keep" | "insert"
     merge_sim: float = 0.0
     merge_cov: float = 0.0
     merge_lr: float = 0.0
@@ -151,7 +151,6 @@ class SrtItem:
 
 @dataclass
 class Seg:
-
     i: int
     t0: float
     t1: float
@@ -189,6 +188,124 @@ def write_srt_items(items: list[SrtItem], out_path: Path) -> None:
         lines.append((it.text or "").strip())
         lines.append("")
     out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def polish_timing(
+    items: list[SrtItem],
+    *,
+    max_dur_s: float = 4.0,
+    min_gap_s: float = 0.06,
+    short_len_n: int = 3,
+    short_start_nudge_s: float = 0.12,
+    max_hold_per_char_s: float = 0.12,
+    min_dur_s: float = 0.65,
+) -> list[SrtItem]:
+    """
+    Timing stabilizer for "early" + "weird holds" cases.
+
+    What it does:
+    - Caps ridiculously long holds (esp. short lines like 「失礼します」)
+    - Nudges very short interjections slightly later (reduces "too early" feel)
+    - Enforces no overlaps + small minimum gap
+    - Splits lines that are super long in time (simple midpoint split, text unchanged)
+    """
+    if not items:
+        return items
+
+    items = sorted(items, key=lambda x: srt_time_to_seconds(x.start))
+
+    out: list[SrtItem] = []
+    for it in items:
+        t0 = srt_time_to_seconds(it.start)
+        t1 = srt_time_to_seconds(it.end)
+        if t1 <= t0:
+            t1 = t0 + min_dur_s
+
+        # 1) Cap long holds based on text length (prevents 10s "失礼します" etc)
+        ntext = normalize_jp(it.text)
+        nlen = len(ntext)
+        if nlen > 0:
+            cap = max(min_dur_s, min(max_dur_s, max_hold_per_char_s * nlen))
+            if (t1 - t0) > cap:
+                t1 = t0 + cap
+
+        # 2) Nudge super short lines later (anime "はあ", "え", "付け", etc)
+        if nlen > 0 and nlen <= short_len_n:
+            # don't nudge if it's already extremely short
+            if (t1 - t0) > 0.20:
+                t0 = min(t0 + short_start_nudge_s, t1 - 0.20)
+
+        # 3) Split lines that are still too long in time (rare after cap, but helps)
+        dur = t1 - t0
+        if dur > max_dur_s + 0.25:
+            mid = t0 + dur * 0.5
+            a = SrtItem(
+                idx=it.idx,
+                start=seconds_to_srt_time(t0),
+                end=seconds_to_srt_time(mid),
+                text=it.text,
+                whisper_text=getattr(it, "whisper_text", ""),
+                kotoba_text=getattr(it, "kotoba_text", ""),
+                merge_decision=getattr(it, "merge_decision", ""),
+                merge_sim=getattr(it, "merge_sim", 0.0),
+                merge_cov=getattr(it, "merge_cov", 0.0),
+                merge_lr=getattr(it, "merge_lr", 0.0),
+                merge_score=getattr(it, "merge_score", 0.0),
+                merge_conf=getattr(it, "merge_conf", 0.0),
+            )
+            b = SrtItem(
+                idx=it.idx,
+                start=seconds_to_srt_time(mid + min_gap_s),
+                end=seconds_to_srt_time(t1),
+                text=it.text,
+                whisper_text=getattr(it, "whisper_text", ""),
+                kotoba_text=getattr(it, "kotoba_text", ""),
+                merge_decision=getattr(it, "merge_decision", ""),
+                merge_sim=getattr(it, "merge_sim", 0.0),
+                merge_cov=getattr(it, "merge_cov", 0.0),
+                merge_lr=getattr(it, "merge_lr", 0.0),
+                merge_score=getattr(it, "merge_score", 0.0),
+                merge_conf=getattr(it, "merge_conf", 0.0),
+            )
+            out.append(a)
+            out.append(b)
+        else:
+            it.start = seconds_to_srt_time(t0)
+            it.end = seconds_to_srt_time(t1)
+            out.append(it)
+
+    # 4) Enforce monotonic timing + minimum gaps (no overlap)
+    out.sort(key=lambda x: srt_time_to_seconds(x.start))
+    for i in range(1, len(out)):
+        prev = out[i - 1]
+        cur = out[i]
+
+        p0 = srt_time_to_seconds(prev.start)
+        p1 = srt_time_to_seconds(prev.end)
+        c0 = srt_time_to_seconds(cur.start)
+        c1 = srt_time_to_seconds(cur.end)
+
+        # ensure prev has sane duration
+        if p1 <= p0:
+            p1 = p0 + min_dur_s
+            prev.end = seconds_to_srt_time(p1)
+
+        # push current start forward if it overlaps or is too tight
+        need = p1 + min_gap_s
+        if c0 < need:
+            shift = need - c0
+            c0 = need
+            # keep end from going backwards; preserve duration if possible
+            c1 = max(c0 + 0.20, c1 + shift)
+
+        # final sanity
+        if c1 <= c0:
+            c1 = c0 + min_dur_s
+
+        cur.start = seconds_to_srt_time(c0)
+        cur.end = seconds_to_srt_time(c1)
+
+    return out
 
 
 def dedupe_consecutive_items(
@@ -307,7 +424,7 @@ def apply_ollama_to_srt_items(items: list[SrtItem], cfg) -> list[SrtItem]:
 
 
 # ----------------------------
-# Normalization + similarity (optimized)
+# Normalization + similarity
 # ----------------------------
 
 _RE_SPACES = re.compile(r"\s+")
@@ -323,6 +440,86 @@ def normalize_jp(s: str) -> str:
     s = _RE_BRACKETS.sub("", s)
     s = _RE_PUNCT.sub("", s)
     return s
+
+
+_RE_JP_SPACE = re.compile(r"[ \t]+")
+
+# sentence-ish endings where "。" is usually safe if missing
+_RE_END_OK = re.compile(
+    r"(だ|です|ます|だった|でした|だろ|だろう|よ|ね|な|ぞ|か|かな|かも|じゃん|じゃない|だな|かよ)$"
+)
+
+# connectors where a comma is often helpful
+_RE_COMMA_CONNECT = re.compile(
+    r"(けど|けれど|から|ので|のに|のだが|のですが|けどさ|でも|しかし|そして|それで|だから|つまり)"
+)
+
+# avoid adding punctuation if line already ends with these
+_END_PUNCT = ("。", "！", "？", "…", "!", "?", "）", ")", "」", "』")
+
+
+def punctuate_jp_line(s: str) -> str:
+    """
+    Light punctuation for JP subtitle lines.
+    Goal: readability, not perfect grammar.
+    """
+    if not s:
+        return s
+
+    # normalize spaces (common from ASR)
+    s = s.replace("\u3000", " ")
+    s = _RE_JP_SPACE.sub(" ", s).strip()
+
+    # split multi-line blocks and punctuate each line gently
+    parts = [p.strip() for p in s.split("\n")]
+    out_parts: list[str] = []
+
+    for line in parts:
+        if not line:
+            continue
+
+        # don't mess with obvious SFX/music bracket lines
+        if line.startswith(("♪", "♬")) or (
+            line.startswith("（") and line.endswith("）")
+        ):
+            out_parts.append(line)
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            out_parts.append(line)
+            continue
+
+        # add commas after common connectors if missing
+        # (only if it looks like a longer clause)
+        if len(normalize_jp(line)) >= 10:
+            line = _RE_COMMA_CONNECT.sub(r"\1、", line)
+
+        # collapse accidental double commas
+        line = line.replace("、、", "、")
+
+        # add sentence end punctuation if it looks like it needs it
+        if not line.endswith(_END_PUNCT):
+            # question-ish
+            if (
+                line.endswith(("か", "の", "かな", "だろ", "だろう"))
+                and len(normalize_jp(line)) >= 4
+            ):
+                line += "？"
+            # exclamation-ish
+            elif line.endswith(("！", "!")):
+                pass
+            # statement-ish
+            elif _RE_END_OK.search(line) and len(normalize_jp(line)) >= 4:
+                line += "。"
+
+        out_parts.append(line)
+
+    return "\n".join(out_parts).strip()
+
+
+def apply_punctuation(items: list[SrtItem]) -> list[SrtItem]:
+    for it in items:
+        it.text = punctuate_jp_line(it.text or "")
+    return items
 
 
 def sim_ratio_norm(a_norm: str, b_norm: str) -> float:
@@ -502,8 +699,6 @@ def best_span_for_whisper_line(
     return best, best_score, best_sim, best_cov, best_lr, best_txt
 
 
-
-
 def _clamp01(x: float) -> float:
     if x <= 0.0:
         return 0.0
@@ -512,7 +707,34 @@ def _clamp01(x: float) -> float:
     return float(x)
 
 
-def _confidence_from_match(sim: float, cov: float, lr: float, *, topic_jump: bool) -> float:
+def _strip_leading_noise(s: str) -> str:
+    return (s or "").lstrip(" 　\t\n「『（()[]【】」』）.,。、!！?？ー-")
+
+
+def _prefix_noise_penalty(whisper: str, cand: str) -> float:
+    """
+    Penalize candidates that look like 'whisper' but with 1-3 extra leading chars.
+    Example: 'しかべてのものを映す鏡' vs '全てのものを映す鏡'
+    """
+    w = _strip_leading_noise(whisper)
+    c = _strip_leading_noise(cand)
+    if not w or not c:
+        return 0.0
+
+    # If same starting char, it's usually fine.
+    if c[0] == w[0]:
+        return 0.0
+
+    # If whisper's first char appears shortly after candidate start, candidate likely has junk prefix.
+    j = c.find(w[0])
+    if 0 < j <= 3:
+        return 0.50 + 0.20 * j  # strong penalty
+    return 0.0
+
+
+def _confidence_from_match(
+    sim: float, cov: float, lr: float, *, topic_jump: bool
+) -> float:
     """Heuristic confidence for a Whisper<->Kotoba match.
 
     0.0 = likely wrong / needs help
@@ -544,7 +766,9 @@ def _write_lowconf_txt(path: Path, rows: list[dict], thresh: float) -> None:
     out.append(f"LOW CONFIDENCE (< {thresh:.2f})")
     out.append("")
     for r in lows:
-        out.append(f"[{r.get('decision','?').upper()} conf={float(r.get('conf',0.0)):.2f}] {r.get('start','')} --> {r.get('end','')}")
+        out.append(
+            f"[{r.get('decision', '?').upper()} conf={float(r.get('conf', 0.0)):.2f}] {r.get('start', '')} --> {r.get('end', '')}"
+        )
         w = (r.get("whisper") or "").strip()
         k = (r.get("kotoba") or "").strip()
         c = (r.get("chosen") or "").strip()
@@ -640,8 +864,14 @@ def auto_merge_and_insert(
                 cov >= TOPIC_JUMP_OVERLAP_AT_LEAST and sim < TOPIC_JUMP_SIM_BELOW
             )
 
+            prefix_pen = _prefix_noise_penalty(it.text, ktxt)
+            prefix_bad = prefix_pen >= 0.50
+            if prefix_bad:
+                reasons.append("prefix_noise")
+
             ok = (
                 (not topic_jump)
+                and (not prefix_bad)
                 and cov >= MIN_OVERLAP_COVERAGE
                 and sim >= SIM_REPLACE_AT_LEAST
                 and (MIN_LEN_RATIO <= lr <= MAX_LEN_RATIO)
@@ -662,8 +892,12 @@ def auto_merge_and_insert(
                     log.append(f"  kotoba : {ktxt}")
                     log.append("")
             else:
-                conf = _confidence_from_match(sim, cov, lr, topic_jump=topic_jump) * 0.85
+                conf = (
+                    _confidence_from_match(sim, cov, lr, topic_jump=topic_jump) * 0.85
+                )
                 reason_bits: list[str] = []
+                if prefix_bad:
+                    reason_bits.append("prefix_noise")
                 if topic_jump:
                     reason_bits.append("topic_jump")
                 if cov < MIN_OVERLAP_COVERAGE:
@@ -675,17 +909,6 @@ def auto_merge_and_insert(
                 reasons = reason_bits
 
                 if out_compare_log:
-
-                    if topic_jump:
-                        reason_bits.append("topic_jump")
-                    if cov < MIN_OVERLAP_COVERAGE:
-                        reason_bits.append(f"cov<{MIN_OVERLAP_COVERAGE}")
-                    if sim < SIM_REPLACE_AT_LEAST:
-                        reason_bits.append(f"sim<{SIM_REPLACE_AT_LEAST}")
-                    if lr < MIN_LEN_RATIO or lr > MAX_LEN_RATIO:
-                        reason_bits.append(
-                            f"lr not in [{MIN_LEN_RATIO},{MAX_LEN_RATIO}]"
-                        )
                     reason = ", ".join(reason_bits) if reason_bits else "guard"
                     log.append(
                         f"[KEEP {reason} sim={sim:.2f} cov={cov:.2f} lr={lr:.2f}] {it.start} --> {it.end}"
@@ -728,7 +951,6 @@ def auto_merge_and_insert(
                 "reasons": reasons,
             }
         )
-
 
     # 2) Gap insertion using unused Kotoba segments (optimized: linear scan + neighbor overlap only)
     inserts: list[SrtItem] = []
@@ -850,8 +1072,6 @@ def auto_merge_and_insert(
 
         print(f"[subloom] Ollama changed {changed}/{len(combined)} lines")
 
-
-    
     # ---- automatic merge report (always) ----
     # Keep it lightweight: a JSON stats file + a tiny low-confidence text file.
     try:
@@ -879,10 +1099,9 @@ def auto_merge_and_insert(
         # reports are best-effort; never fail the run because of them
         pass
 
-
-# collapse obvious consecutive duplicates (anime-style spam repeats)
+    # collapse obvious consecutive duplicates (anime-style spam repeats)
     combined = dedupe_consecutive_items(combined, window_s=1.5, short_len=10)
-
+    combined = polish_timing(combined)
     write_srt_items(combined, out_final_srt)
 
     if out_compare_log:

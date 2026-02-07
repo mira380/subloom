@@ -6,14 +6,8 @@ from typing import Iterable, List, Optional, Tuple
 
 from difflib import SequenceMatcher
 import wave
-import array
 import math
-
-# audioop is faster
-try:
-    import audioop  # type: ignore
-except Exception:
-    audioop = None  # type: ignore
+import numpy as np
 
 from merge_subs import (
     SrtItem,
@@ -275,10 +269,10 @@ def _wav_info(path: Path) -> Tuple[int, int]:
         return wf.getnchannels(), wf.getframerate()
 
 
-def _read_wav_mono_i16(path: Path) -> Tuple[int, array.array]:
+def _read_wav_mono_i16(path: Path) -> Tuple[int, np.ndarray]:
     """
-    Returns (sr, samples) where samples are int16 mono.
-    If file has 2ch, we downmix (L+R)/2 in Python.
+    Returns (sr, samples) where samples are int16 mono (NumPy array).
+    If file has 2ch, we downmix (L+R)/2.
     """
     with wave.open(str(path), "rb") as wf:
         ch = wf.getnchannels()
@@ -292,34 +286,39 @@ def _read_wav_mono_i16(path: Path) -> Tuple[int, array.array]:
             )
 
         raw = wf.readframes(nframes)
-        data = array.array("h")
-        data.frombytes(raw)
+        # Convert buffer to numpy array
+        data = np.frombuffer(raw, dtype=np.int16)
 
         if ch == 1:
             return sr, data
 
         if ch == 2:
-            mono = array.array("h")
-            mono_extend = mono.append
-            # data is interleaved L R L R...
-            for i in range(0, len(data), 2):
-                mono_extend(int((data[i] + data[i + 1]) / 2))
+            # Reshape to (n_frames, 2)
+            # Wave data is interleaved: L, R, L, R...
+            data = data.reshape(-1, 2)
+            # Downmix to mono by averaging (and casting back to int16)
+            mono = data.mean(axis=1).astype(np.int16)
             return sr, mono
 
         raise RuntimeError(f"Unsupported channel count: {ch} for {path}")
 
 
-def _rms_dbfs(frame: array.array) -> float:
-    if not frame:
+def _rms_dbfs_numpy(frame: np.ndarray) -> float:
+    """
+    Calculate dBFS using NumPy for speed.
+    """
+    if frame.size == 0:
         return -120.0
-    # int16 full-scale is 32768
-    acc = 0.0
-    for x in frame:
-        acc += float(x) * float(x)
-    mean = acc / float(len(frame))
-    rms = math.sqrt(mean)
+
+    # Cast to float64 to avoid overflow during square
+    f = frame.astype(np.float64)
+    mean_sq = np.mean(f * f)
+
+    rms = math.sqrt(mean_sq)
     if rms <= 0.0:
         return -120.0
+
+    # int16 full-scale is 32768
     db = 20.0 * math.log10(rms / 32768.0)
     return db
 
@@ -331,121 +330,28 @@ def _speech_regions_from_energy(
     dbfs_thresh: float,
     min_region_s: float,
 ) -> List[Tuple[float, float]]:
-    # Fast path: stream frames and compute RMS in C via audioop
-    if audioop is not None:
-        with wave.open(str(wav_path), "rb") as wf:
-            ch = wf.getnchannels()
-            sr = wf.getframerate()
-            sampwidth = wf.getsampwidth()
+    # Use NumPy approach for everything (replaces old audioop + fallback)
+    try:
+        sr, samples = _read_wav_mono_i16(wav_path)
+    except Exception as e:
+        # Fallback if standard read fails (odd headers, etc - unlikely with ffmpeg inputs)
+        print(
+            f"[subloom] warning: numpy wav read failed, skipping energy detection: {e}"
+        )
+        return []
 
-            if sampwidth != 2:
-                # fallback to old code for odd formats
-                sr2, samples = _read_wav_mono_i16(wav_path)
-                hop = max(1, int(sr2 * (frame_ms / 1000.0)))
-                regions: List[Tuple[float, float]] = []
-                in_region = False
-                start_i = 0
-                for i in range(0, len(samples), hop):
-                    frame = samples[i : i + hop]
-                    db = _rms_dbfs(frame)
-                    if db >= dbfs_thresh and not in_region:
-                        in_region = True
-                        start_i = i
-                    elif db < dbfs_thresh and in_region:
-                        in_region = False
-                        end_i = i
-                        s = start_i / sr2
-                        e = end_i / sr2
-                        if (e - s) >= min_region_s:
-                            regions.append((s, e))
-                if in_region:
-                    s = start_i / sr2
-                    e = len(samples) / sr2
-                    if (e - s) >= min_region_s:
-                        regions.append((s, e))
-                return _merge_intervals(regions)
-
-            hop_frames = max(1, int(sr * (frame_ms / 1000.0)))
-            regions: List[Tuple[float, float]] = []
-            in_region = False
-            start_t = 0.0
-
-            frame_index = 0
-            while True:
-                raw = wf.readframes(hop_frames)
-                if not raw:
-                    break
-
-                # downmix stereo to mono bytes if needed
-                if ch == 2:
-                    raw_mono = audioop.tomono(raw, 2, 0.5, 0.5)
-                elif ch == 1:
-                    raw_mono = raw
-                else:
-                    # weird multi-channel: fallback to old method
-                    sr2, samples = _read_wav_mono_i16(wav_path)
-                    hop = max(1, int(sr2 * (frame_ms / 1000.0)))
-                    regions2: List[Tuple[float, float]] = []
-                    in_region2 = False
-                    start_i2 = 0
-                    for i in range(0, len(samples), hop):
-                        frame = samples[i : i + hop]
-                        db = _rms_dbfs(frame)
-                        if db >= dbfs_thresh and not in_region2:
-                            in_region2 = True
-                            start_i2 = i
-                        elif db < dbfs_thresh and in_region2:
-                            in_region2 = False
-                            end_i2 = i
-                            s = start_i2 / sr2
-                            e = end_i2 / sr2
-                            if (e - s) >= min_region_s:
-                                regions2.append((s, e))
-                    if in_region2:
-                        s = start_i2 / sr2
-                        e = len(samples) / sr2
-                        if (e - s) >= min_region_s:
-                            regions2.append((s, e))
-                    return _merge_intervals(regions2)
-
-                rms = audioop.rms(raw_mono, 2)  # int16 RMS
-                if rms <= 0:
-                    db = -120.0
-                else:
-                    db = 20.0 * math.log10(rms / 32768.0)
-
-                t0 = (frame_index * hop_frames) / sr
-
-                if db >= dbfs_thresh and not in_region:
-                    in_region = True
-                    start_t = t0
-                elif db < dbfs_thresh and in_region:
-                    in_region = False
-                    end_t = t0
-                    if (end_t - start_t) >= min_region_s:
-                        regions.append((start_t, end_t))
-
-                frame_index += 1
-
-            if in_region:
-                end_t = (frame_index * hop_frames) / sr
-                if (end_t - start_t) >= min_region_s:
-                    regions.append((start_t, end_t))
-
-        return _merge_intervals(regions)
-
-    # Fallback: array-based scanner
-    sr, samples = _read_wav_mono_i16(wav_path)
     hop = max(1, int(sr * (frame_ms / 1000.0)))
 
+    # Slice samples into chunks (last chunk might be shorter)
+    # We loop manually to keep memory reasonable, though purely vectorizing could work too
     regions: List[Tuple[float, float]] = []
     in_region = False
     start_i = 0
+    n_samples = len(samples)
 
-    # We step by hop, using hop-sized frames
-    for i in range(0, len(samples), hop):
+    for i in range(0, n_samples, hop):
         frame = samples[i : i + hop]
-        db = _rms_dbfs(frame)
+        db = _rms_dbfs_numpy(frame)
 
         if db >= dbfs_thresh and not in_region:
             in_region = True
@@ -460,7 +366,7 @@ def _speech_regions_from_energy(
 
     if in_region:
         s = start_i / sr
-        e = len(samples) / sr
+        e = n_samples / sr
         if (e - s) >= min_region_s:
             regions.append((s, e))
 

@@ -68,7 +68,11 @@ def _hard_split(text: str, max_chars: int) -> list[str]:
         return []
     if max_chars <= 1:
         return [t]
-    return [t[i : i + max_chars].strip() for i in range(0, len(t), max_chars) if t[i : i + max_chars].strip()]
+    return [
+        t[i : i + max_chars].strip()
+        for i in range(0, len(t), max_chars)
+        if t[i : i + max_chars].strip()
+    ]
 
 
 def _split_to_max_chars(text: str, max_chars: int) -> list[str]:
@@ -203,6 +207,7 @@ def export_srt_from_whisper_json(
         SRT_MAX_CHARS_PER_CAPTION,
         SRT_MAX_CHARS_PER_LINE,
     )
+
     raw = json_path.read_bytes()
     # Whisper JSON should be UTF-8, but some builds output odd bytes.
     # Decode safely so no crashes.
@@ -301,15 +306,13 @@ def export_srt_from_whisper_json(
                 starts_ends.append((s0, e0))
                 cur_t = e0
 
-        for (chunk_text, (s0, e0)) in zip(chunks, starts_ends):
+        for chunk_text, (s0, e0) in zip(chunks, starts_ends):
             txt = _wrap_lines(chunk_text, int(SRT_MAX_CHARS_PER_LINE) or 999999)
             if not txt.strip():
                 continue
 
             out_lines.append(str(idx))
-            out_lines.append(
-                f"{seconds_to_srt_time(s0)} --> {seconds_to_srt_time(e0)}"
-            )
+            out_lines.append(f"{seconds_to_srt_time(s0)} --> {seconds_to_srt_time(e0)}")
             out_lines.append(txt)
             out_lines.append("")
             idx += 1

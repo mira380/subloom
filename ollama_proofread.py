@@ -297,7 +297,9 @@ def _len_ratio(a: str, b: str) -> float:
     return lb / max(1, la)
 
 
-def is_suspicious(sub: Dict[str, Any], cfg: OllamaConfig) -> Tuple[bool, int, List[str]]:
+def is_suspicious(
+    sub: Dict[str, Any], cfg: OllamaConfig
+) -> Tuple[bool, int, List[str]]:
     """Automatic gate: decide whether a line is worth sending to the LLM.
 
     Returns (should_check, context_lines, reasons)
@@ -336,7 +338,10 @@ def is_suspicious(sub: Dict[str, Any], cfg: OllamaConfig) -> Tuple[bool, int, Li
         sim_wk = _sim_norm(whisper, kotoba)
         lr_wk = _len_ratio(whisper, kotoba)
 
-        if sim_wk < 0.80 and (len(_normalize_jp(whisper)) + len(_normalize_jp(kotoba))) >= 10:
+        if (
+            sim_wk < 0.80
+            and (len(_normalize_jp(whisper)) + len(_normalize_jp(kotoba))) >= 10
+        ):
             reasons.append(f"wk_disagree:{sim_wk:.2f}")
         if lr_wk < 0.60 or lr_wk > 1.80:
             reasons.append(f"wk_lenratio:{lr_wk:.2f}")
@@ -360,7 +365,9 @@ def is_suspicious(sub: Dict[str, Any], cfg: OllamaConfig) -> Tuple[bool, int, Li
         ctx = max(ctx, 2)
     if any(r.startswith("merge_low") for r in reasons):
         ctx = max(ctx, 2)
-    if any(r.startswith("merge_low:0.") for r in reasons) and any(r.startswith("wk_disagree") for r in reasons):
+    if any(r.startswith("merge_low:0.") for r in reasons) and any(
+        r.startswith("wk_disagree") for r in reasons
+    ):
         ctx = max(ctx, 3)
     return should, ctx, reasons
 
