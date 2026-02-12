@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+import os
 
 # ----------------------------
 # Project paths
@@ -41,29 +42,86 @@ FINAL_TAG: Final[str] = "final"
 COMPARE_TAG: Final[str] = "compare"
 
 # ----------------------------
+# Subtitle / VAD defaults
+# ----------------------------
+SRT_NO_SPLIT_UNDER_S: Final[float] = 1.6
+VAD_FRAME_MS: Final[int] = 30
+VAD_DBFS_THRESH: Final[float] = -34.0
+VAD_MIN_REGION_S: Final[float] = 0.25
+VAD_PAD_S: Final[float] = 0.22
+VAD_MERGE_GAP_S: Final[float] = 0.25
+VAD_MAX_WINDOW_S: Final[float] = 12.0
+VAD_MAX_TOTAL_DECODE_S: Final[float] = 240.0
+CONF_TIMING_LOWCONF: Final[float] = 0.18
+CONF_TIMING_MAX_EXTRA_END_S: Final[float] = 0.18
+
+# ----------------------------
+# RNNoise defaults
+# ----------------------------
+RNNOISE_REQUIRED: Final[bool] = True
+RNNOISE_MODE_DEFAULT: Final[str] = "chunk"  # fixed|chunk
+RNNOISE_MIX_DEFAULT: Final[float] = 0.51
+RNNOISE_CHUNK_S_DEFAULT: Final[float] = 20.0
+RNNOISE_MIX_MIN_DEFAULT: Final[float] = 0.28
+RNNOISE_MIX_MAX_DEFAULT: Final[float] = 0.80
+RNNOISE_ANALYSIS_FRAME_MS_DEFAULT: Final[int] = 30
+
+
+def resolve_rnnoise_model() -> Path:
+    """Locate RNNoise .rnnn model. Required if RNNOISE_REQUIRED is True."""
+    env = os.environ.get("SUBLOOM_RNNOISE_MODEL")
+    if env:
+        p = Path(env).expanduser()
+        if p.exists():
+            return p
+        raise RuntimeError(f"RNNoise model not found at: {p}")
+
+    models_dir = APP_DIR / "models" / "arnndn-models"
+    if not models_dir.exists():
+        raise RuntimeError(
+            f"RNNoise models directory not found: {models_dir}\n"
+            "Place a .rnnn model in subloom/models/arnndn-models/ (e.g. std.rnnn)."
+        )
+
+    cands = sorted(models_dir.glob("*.rnnn"))
+    if not cands:
+        raise RuntimeError(
+            f"No .rnnn RNNoise models found in: {models_dir}\n"
+            "Download/copy a model there (e.g. std.rnnn)."
+        )
+
+    return cands[0]
+
+
+# ----------------------------
 # SRT formatting limits
 # ----------------------------
 
 # Safety cap: a single subtitle entry will never exceed this duration.
 MAX_SRT_LINE_DUR: Final[float] = 10.0
 
-# If subs feel early, increase this a bit (0.12–0   .25 is usually the sweet spot).
+# If subs feel early, increase this a bit (0.12–0.25 is usually the sweet spot).
 # This shifts BOTH start + end later to preserve the original duration.
-SRT_SHIFT_S: Final[float] = 0.20
+SRT_SHIFT_S: Final[float] = 0.18
 
-# How short we allow a generated/split caption to be (seconds).
-SRT_MIN_CAPTION_DUR_S: Final[float] = 0.85
+# Minimum caption duration - balanced to prevent cutoffs without being too long
+SRT_MIN_CAPTION_DUR_S: Final[float] = 0.70
 
-# If a whisper line is too long, split it into multiple SRT entries.
-# This is the "no wall of text" knob.
+# Generous character limits to reduce aggressive splitting
 SRT_MAX_CHARS_PER_CAPTION: Final[int] = 50
 
-# Also wrap text inside a caption so it doesn’t become one mega-line.
+# Also wrap text inside a caption so it doesn't become one mega-line.
 SRT_MAX_CHARS_PER_LINE: Final[int] = 25
 
-# Extra control: shift start and end separately (helps when only the *start* is early)
-SRT_SHIFT_START_S = 0.12
-SRT_SHIFT_END_S = 0.35
+# Only slight adjustments needed since speech estimation is (probably??) now accurate
+SRT_SHIFT_START_S = 0.0  # Minimal start adjustment
+SRT_SHIFT_END_S = 0.0  # Minimal end adjustment
+
+# Small buffer ensures subtitles don't feel cut off
+SRT_END_PADDING_S: Final[float] = 0.10
+
+# Prevents previous subtitle from bleeding into next one
+SRT_MIN_GAP_S: Final[float] = 0.0
 
 
 def ensure_project_dirs() -> None:

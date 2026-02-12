@@ -190,6 +190,90 @@ def write_srt_items(items: list[SrtItem], out_path: Path) -> None:
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def drop_very_low_confidence(
+    items: list[SrtItem],
+    *,
+    conf_thresh: float = 0.08,
+    sim_thresh: float = 0.20,
+    cov_thresh: float = 0.30,
+) -> list[SrtItem]:
+    """
+    Remove lines that are extremely likely to be ASR hallucinations.
+
+    A line is dropped only if ALL of these are true:
+    - very low merge confidence
+    - very low similarity between ASR outputs
+    - very low coverage
+
+    This targets sound-effect hallucinations and nonsense lines
+    without harming real dialogue.
+    """
+    out: list[SrtItem] = []
+
+    for it in items:
+        conf = getattr(it, "merge_conf", 1.0)
+        sim = getattr(it, "wk_sim", 1.0)
+        cov = getattr(it, "wk_cov", 1.0)
+
+        if conf < conf_thresh and sim < sim_thresh and cov < cov_thresh:
+            # drop this line
+            continue
+
+        out.append(it)
+
+    return out
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _text_len_for_speed(text: str) -> int:
+    t = (text or "").strip()
+    if not t:
+        return 0
+    # ignore obvious SFX/music bracket lines in speed estimation
+    if t.startswith(("♪", "♬")):
+        return 0
+    if (t.startswith("（") and t.endswith("）")) or (
+        t.startswith("[") and t.endswith("]")
+    ):
+        return 0
+    return len(normalize_jp(t))
+
+
+def _estimate_local_cps(
+    items: list[SrtItem], idx: int, fallback_cps: float = 12.0
+) -> float:
+    """
+    Estimate speaking speed (chars/sec) using a small window around idx.
+    Uses existing subtitle durations (end-start), which becomes better after earlier passes.
+    """
+    lo = max(0, idx - 2)
+    hi = min(len(items), idx + 3)
+
+    total_chars = 0
+    total_time = 0.0
+
+    for j in range(lo, hi):
+        it = items[j]
+        t0 = srt_time_to_seconds(it.start)
+        t1 = srt_time_to_seconds(it.end)
+        dur = max(0.01, t1 - t0)
+        n = _text_len_for_speed(it.text)
+        if n <= 0:
+            continue
+        total_chars += n
+        total_time += dur
+
+    if total_chars <= 0 or total_time <= 0.01:
+        return fallback_cps
+
+    cps = total_chars / total_time
+    # keep it sane (anime dialogue gets fast but not infinite)
+    return _clamp(cps, 6.0, 22.0)
+
+
 def polish_timing(
     items: list[SrtItem],
     *,
@@ -311,9 +395,9 @@ def polish_timing(
 def extend_end_by_text_length(
     items: list[SrtItem],
     *,
-    base_s: float = 0.10,
+    base_s: float = 0.13,
     per_char_s: float = 0.010,
-    max_extra_s: float = 0.35,
+    max_extra_s: float = 0.45,
     min_gap_s: float = 0.06,
 ) -> list[SrtItem]:
     """
@@ -347,6 +431,85 @@ def extend_end_by_text_length(
             cur.end = seconds_to_srt_time(new_end)
 
     return items
+
+
+def confidence_end_padding(items: list[SrtItem]) -> list[SrtItem]:
+    """
+    Adds a tiny extra end padding only for "risky" lines (low merge_conf / disagreement),
+    while keeping overlaps safe.
+
+    This helps with the classic "subtitle ends too early" feeling without making the whole
+    episode laggy.
+    """
+    try:
+        from settings import (
+            CONF_TIMING_LOWCONF,
+            CONF_TIMING_MAX_EXTRA_END_S,
+        )
+    except Exception:
+        return items
+
+    if not getattr(__import__("settings"), "CONF_TIMING_ENABLE", True):
+        return items
+    if not items:
+        return items
+
+    out = sorted(items, key=lambda it: srt_time_to_seconds(it.start))
+
+    min_gap = float(getattr(__import__("settings"), "SRT_MIN_GAP_S", 0.0) or 0.0)
+    low = float(CONF_TIMING_LOWCONF)
+    max_extra = float(CONF_TIMING_MAX_EXTRA_END_S)
+
+    # Precompute neighbor starts for overlap-safe extension
+    starts = [srt_time_to_seconds(it.start) for it in out]
+    ends = [srt_time_to_seconds(it.end) for it in out]
+
+    for i, it in enumerate(out):
+        conf = float(getattr(it, "merge_conf", 0.0) or 0.0)
+        txt = (it.text or "").strip()
+
+        if not txt:
+            continue
+
+        # Compute a simple disagreement signal if we have both texts
+        wtxt = normalize_jp(getattr(it, "whisper_text", "") or "")
+        ktxt = normalize_jp(getattr(it, "kotoba_text", "") or "")
+        disagree = False
+        if wtxt and ktxt:
+            disagree = sim_ratio_norm(wtxt, ktxt) < 0.55
+
+        risky = (
+            (conf > 0.0 and conf < low)
+            or disagree
+            or (getattr(it, "merge_decision", "") == "insert")
+        )
+        if not risky:
+            continue
+
+        # Don't bloat already-long lines
+        dur = ends[i] - starts[i]
+        if dur >= 4.5:
+            continue
+        if len(normalize_jp(txt)) <= 3:
+            continue
+
+        # Scale extra padding by how low confidence is
+        if conf <= 0.0:
+            extra = max_extra * (0.75 if disagree else 0.50)
+        else:
+            frac = (low - conf) / max(low, 1e-6)
+            extra = max_extra * max(0.15, min(1.0, frac))
+
+        # Overlap-safe cap
+        hard_cap = ends[i] + extra
+        if i + 1 < len(out):
+            next_start = starts[i + 1]
+            hard_cap = min(hard_cap, next_start - max(0.01, min_gap))
+        if hard_cap > ends[i]:
+            ends[i] = hard_cap
+            it.end = seconds_to_srt_time(ends[i])
+
+    return out
 
 
 def dedupe_consecutive_items(
@@ -1207,6 +1370,8 @@ def auto_merge_and_insert(
     combined = merge_whisper_micro_lines(combined)
     combined = dedupe_consecutive_items(combined, window_s=1.5, short_len=10)
     combined = extend_end_by_text_length(combined)
+    combined = drop_very_low_confidence(combined)
+    combined = confidence_end_padding(combined)
     combined = polish_timing(
         combined,
         max_dur_s=7.0,

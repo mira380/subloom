@@ -8,9 +8,6 @@ from typing import Optional
 
 from merge_subs import run, seconds_to_srt_time
 
-# NOTE: Import settings lazily inside export_srt_from_whisper_json()
-# to avoid any annoying import-order surprises.
-
 
 @dataclass
 class WhisperPaths:
@@ -21,303 +18,346 @@ class WhisperPaths:
 
 _RE_WS = re.compile(r"\s+")
 
+# Common filler phrases from BGM/outros
+_FILLER_PHRASES = {
+    "ご視聴ありがとうございました",
+}
 
-def _clean_text_for_split(s: str) -> str:
+
+def _is_filler_phrase(text: str) -> bool:
+    """Check if text is a common filler/outro phrase."""
+    return text.strip() in _FILLER_PHRASES
+
+
+def _clean_text(s: str) -> str:
+    """Normalize whitespace."""
     s = (s or "").strip()
     if not s:
         return ""
-    # keep JP readable; just normalize whitespace
-    s = _RE_WS.sub(" ", s)
-    return s.strip()
+    return _RE_WS.sub(" ", s).strip()
 
 
-def _split_by_preferred_punct(text: str) -> list[str]:
+def _estimate_reading_time(text: str) -> float:
     """
-    First pass: split at sentence-ish punctuation when possible.
-    Keeps punctuation attached.
+    Estimate minimum time needed to read Japanese text.
+    Longer text gets proportionally more time (people slow down for long sentences).
     """
-    t = (text or "").strip()
-    if not t:
-        return []
+    clean = _clean_text(text)
+    if not clean:
+        return 0.4
 
-    out: list[str] = []
-    buf: list[str] = []
-    enders = set("。！？!?")
+    char_count = len(clean)
 
-    for ch in t:
-        buf.append(ch)
-        if ch in enders:
-            s = "".join(buf).strip()
-            if s:
-                out.append(s)
-            buf = []
+    # Base rate: 6 chars/sec for short text
+    # But slow down for longer text (harder to process)
+    if char_count <= 15:
+        rate = 6.0  # Fast, easy to read
+    elif char_count <= 30:
+        rate = 5.5  # Medium
+    else:
+        rate = 5.0  # Slower for long sentences
 
-    tail = "".join(buf).strip()
-    if tail:
-        out.append(tail)
-
-    return out
+    return max(0.4, char_count / rate)
 
 
-def _hard_split(text: str, max_chars: int) -> list[str]:
+def _split_text_smart(text: str, max_chars: int) -> list[str]:
     """
-    Last-resort split: chunk by character count.
+    Split text at natural boundaries.
+    Priority: 。！？!? -> 、， -> character limit
     """
-    t = (text or "").strip()
-    if not t:
-        return []
-    if max_chars <= 1:
-        return [t]
-    return [
-        t[i : i + max_chars].strip()
-        for i in range(0, len(t), max_chars)
-        if t[i : i + max_chars].strip()
-    ]
+    text = _clean_text(text)
+    if not text or len(text) <= max_chars:
+        return [text] if text else []
 
+    # Split at sentence enders
+    sentence_enders = set("。！？!?")
+    parts = []
+    current = ""
 
-def _split_to_max_chars(text: str, max_chars: int) -> list[str]:
-    """
-    Split text into multiple caption-sized chunks with a preference order:
-      1) sentence enders: 。！？!? (kept)
-      2) soft breaks: 、, (kept)
-      3) hard split by length
-    """
-    t = _clean_text_for_split(text)
-    if not t:
-        return []
+    for char in text:
+        current += char
+        if char in sentence_enders:
+            if len(current) <= max_chars:
+                parts.append(current.strip())
+                current = ""
+            else:
+                parts.append(current.strip())
+                current = ""
 
-    if len(t) <= max_chars:
-        return [t]
+    if current.strip():
+        parts.append(current.strip())
 
-    # 1) Sentence-ish split
-    parts = _split_by_preferred_punct(t)
     if not parts:
-        parts = [t]
+        parts = [text]
 
-    # Now pack parts into <= max_chars chunks
-    packed: list[str] = []
-    cur = ""
-
-    def flush():
-        nonlocal cur
-        if cur.strip():
-            packed.append(cur.strip())
-        cur = ""
-
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-
-        if not cur:
-            cur = p
-            continue
-
-        if len(cur) + len(p) <= max_chars:
-            cur = cur + p
-            continue
-
-        flush()
-        cur = p
-
-    flush()
-
-    # 2) If any packed chunk is still too long, try splitting on commas
-    fixed: list[str] = []
-    soft_breaks = ("、", ",", "，")
-
-    for chunk in packed:
-        if len(chunk) <= max_chars:
-            fixed.append(chunk)
-            continue
-
-        # split by soft breaks, keep delimiter
-        buf = ""
-        for ch in chunk:
-            buf += ch
-            if ch in soft_breaks and len(buf) >= max(6, max_chars // 3):
-                fixed.append(buf.strip())
-                buf = ""
-        if buf.strip():
-            fixed.append(buf.strip())
-
-    # 3) Final guarantee (hard split)
-    final: list[str] = []
-    for chunk in fixed:
-        if len(chunk) <= max_chars:
-            final.append(chunk)
+    # Split any parts that are still too long
+    final_parts = []
+    for part in parts:
+        if len(part) <= max_chars:
+            final_parts.append(part)
         else:
-            final.extend(_hard_split(chunk, max_chars))
+            # Split at commas
+            soft_breaks = "、，,"
+            sub_parts = []
+            buf = ""
+            for char in part:
+                buf += char
+                if char in soft_breaks and len(buf) >= 10:
+                    sub_parts.append(buf.strip())
+                    buf = ""
+            if buf.strip():
+                sub_parts.append(buf.strip())
 
-    return [x for x in (s.strip() for s in final) if x]
+            # Hard split if still too long
+            for sub in sub_parts:
+                if len(sub) <= max_chars:
+                    final_parts.append(sub)
+                else:
+                    for i in range(0, len(sub), max_chars):
+                        chunk = sub[i : i + max_chars].strip()
+                        if chunk:
+                            final_parts.append(chunk)
+
+    return [p for p in final_parts if p]
 
 
-def _wrap_lines(text: str, max_line_chars: int) -> str:
-    """
-    Wrap into 1–2 lines if needed.
-    Uses punctuation as a nicer break when possible.
-    """
-    t = (text or "").strip()
-    if not t:
-        return ""
+def _wrap_lines(text: str, max_line_len: int) -> str:
+    """Wrap text into 1-2 lines."""
+    text = _clean_text(text)
+    if not text or len(text) <= max_line_len:
+        return text
 
-    if max_line_chars <= 0 or len(t) <= max_line_chars:
-        return t
+    # Try splitting at punctuation near middle
+    mid = len(text) // 2
+    search_range = 8
 
-    # Try to find a good split point near the middle
-    target = min(len(t) - 1, max_line_chars)
-    candidates = []
+    punct = set("。！？!?、，,")
+    best_split = None
+    best_distance = float("inf")
 
-    # Prefer these as line breaks
-    preferred = set("、,，。！？!?")
+    for i in range(max(0, mid - search_range), min(len(text), mid + search_range)):
+        if i < len(text) and text[i] in punct:
+            distance = abs(i - mid)
+            if distance < best_distance:
+                best_distance = distance
+                best_split = i + 1
 
-    for i in range(max(1, target - 8), min(len(t) - 1, target + 8) + 1):
-        if t[i] in preferred:
-            candidates.append(i + 1)  # split AFTER punctuation
+    if best_split:
+        line1 = text[:best_split].strip()
+        line2 = text[best_split:].strip()
+        if line1 and line2:
+            return f"{line1}\n{line2}"
 
-    if candidates:
-        cut = min(candidates, key=lambda x: abs(x - target))
-        a = t[:cut].strip()
-        b = t[cut:].strip()
-        if a and b:
-            return a + "\n" + b
+    # Fallback
+    if len(text) > max_line_len:
+        line1 = text[:max_line_len].strip()
+        line2 = text[max_line_len:].strip()
+        if line1 and line2:
+            return f"{line1}\n{line2}"
 
-    # Fallback: straight cut
-    a = t[:target].strip()
-    b = t[target:].strip()
-    if a and b:
-        return a + "\n" + b
-    return t
+    return text
 
 
 def export_srt_from_whisper_json(
     json_path: Path, srt_path: Path, max_line_dur: float
 ) -> None:
     """
-    whisper.cpp outputs a JSON 'transcription' list with millisecond offsets.
-    This writes a normal SRT while:
-      - shifting timestamps later (fixes "subs come too early")
-      - splitting long captions (fixes "wall of text")
-      - wrapping to 1–2 lines
+    Generate SRT from Whisper JSON with robust timing.
+
+    Core principles:
+    - Trust Whisper's timing (it knows when speech starts/ends)
+    - Only extend subtitles to fill small gaps (< 3s)
+    - Ensure minimum reading time
+    - Filter BGM phrases at the end
     """
     from settings import (
-        SRT_SHIFT_START_S,
-        SRT_SHIFT_END_S,
-        SRT_MIN_CAPTION_DUR_S,
         SRT_MAX_CHARS_PER_CAPTION,
         SRT_MAX_CHARS_PER_LINE,
     )
 
+    # Load JSON
     raw = json_path.read_bytes()
-    # Whisper JSON should be UTF-8, but some builds output odd bytes.
-    # Decode safely so no crashes.
-    text = raw.decode("utf-8", errors="replace")
-
     try:
-        data = json.loads(text)
+        data = json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
-        # fallback: ignore bad bytes completely
-        text2 = raw.decode("utf-8", errors="ignore")
-        data = json.loads(text2)
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
 
     transcription = data.get("transcription")
     if not isinstance(transcription, list):
-        keys = (
-            ", ".join(list(data.keys())[:30])
-            if isinstance(data, dict)
-            else "<not a dict>"
-        )
-        raise RuntimeError(
-            f"Expected 'transcription' list in whisper JSON. Top-level keys: {keys}"
-        )
+        raise RuntimeError("Expected 'transcription' list in Whisper JSON")
 
-    out_lines: list[str] = []
-    idx = 1
-
+    # Extract entries
+    entries = []
     for item in transcription:
         if not isinstance(item, dict):
             continue
 
-        raw_text = (item.get("text") or "").strip()
-        if not raw_text:
+        text = (item.get("text") or "").strip()
+        if not text:
             continue
 
         offsets = item.get("offsets") or {}
         start_ms = offsets.get("from")
         end_ms = offsets.get("to")
+
         if start_ms is None or end_ms is None:
             continue
 
-        start_s = float(start_ms) / 1000.0
-        end_s = float(end_ms) / 1000.0
+        start_s = start_ms / 1000.0
+        end_s = end_ms / 1000.0
+
         if end_s <= start_s:
-            end_s = start_s + 1.2
+            continue
 
-        # Shift later if subs feel early
-        # (start shift slightly bigger than end shift to stop early pop-in)
-        if SRT_SHIFT_START_S or SRT_SHIFT_END_S:
-            start_s = max(0.0, start_s + float(SRT_SHIFT_START_S))
-            end_s = max(start_s + 0.10, end_s + float(SRT_SHIFT_END_S))
+        entries.append(
+            {
+                "text": text,
+                "start": start_s,
+                "end": end_s,
+            }
+        )
 
-        # Cap extreme long durations (safety)
-        dur = end_s - start_s
-        if dur > max_line_dur:
-            end_s = start_s + float(max_line_dur)
-            dur = end_s - start_s
+    if not entries:
+        srt_path.write_text("", encoding="utf-8")
+        return
 
-        # Split long text into multiple caption entries
-        chunks = _split_to_max_chars(raw_text, int(SRT_MAX_CHARS_PER_CAPTION) or 999999)
+    # Find video duration for filler filtering
+    total_duration = max(e["end"] for e in entries)
+    filter_threshold = total_duration - 30.0
+
+    # Process entries
+    subtitles = []
+
+    for entry in entries:
+        text = entry["text"]
+        start = entry["start"]
+        end = entry["end"]
+
+        # Filter BGM fillers at the end
+        if start >= filter_threshold and _is_filler_phrase(text):
+            continue
+
+        # Ensure subtitle lasts long enough to read
+        duration = end - start
+        min_duration = _estimate_reading_time(text)
+
+        if duration < min_duration:
+            end = start + min_duration
+
+        # Cap maximum
+        if duration > max_line_dur:
+            end = start + max_line_dur
+
+        # Split if text is too long
+        max_caption_chars = int(SRT_MAX_CHARS_PER_CAPTION)
+        chunks = _split_text_smart(text, max_caption_chars)
+
         if not chunks:
             continue
 
-        # Time-split: allocate duration proportionally to text length
-        # (simple + stable, and it avoids "one chunk gets 0.1s")
-        lens = [max(1, len(c)) for c in chunks]
-        total_len = sum(lens)
-
-        # If whisper gave us an ultra-short duration but we have multiple chunks,
-        # enforce a minimum-per-caption where possible.
-        min_d = float(SRT_MIN_CAPTION_DUR_S)
         if len(chunks) == 1:
-            starts_ends = [(start_s, end_s)]
+            subtitles.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": chunks[0],
+                }
+            )
         else:
-            desired = len(chunks) * min_d
-            if dur < desired:
-                # We can't magically create time, so we distribute what we have,
-                # but we still keep each chunk non-zero.
-                min_d = max(0.28, dur / len(chunks))
+            # Distribute time across chunks
+            total_chars = sum(len(c) for c in chunks)
+            current_time = start
 
-            cur_t = start_s
-            starts_ends = []
-            for i, (chunk_text, chunk_len) in enumerate(zip(chunks, lens)):
-                # last chunk gets whatever remains (prevents drift)
+            for i, chunk in enumerate(chunks):
+                chunk_chars = len(chunk)
+
                 if i == len(chunks) - 1:
-                    s0 = cur_t
-                    e0 = end_s
+                    # Last chunk
+                    chunk_start = current_time
+                    chunk_end = end
                 else:
-                    share = dur * (chunk_len / total_len)
-                    share = max(min_d, share)
-                    s0 = cur_t
-                    e0 = min(end_s, s0 + share)
+                    # Proportional time
+                    chunk_duration = (end - start) * (chunk_chars / total_chars)
+                    chunk_min = _estimate_reading_time(chunk)
+                    chunk_duration = max(chunk_duration, chunk_min)
 
-                if e0 <= s0:
-                    e0 = min(end_s, s0 + 0.30)
+                    chunk_start = current_time
+                    chunk_end = min(end, chunk_start + chunk_duration)
+                    current_time = chunk_end
 
-                starts_ends.append((s0, e0))
-                cur_t = e0
+                # Safety minimum
+                if chunk_end - chunk_start < 0.3:
+                    chunk_end = chunk_start + 0.3
 
-        for chunk_text, (s0, e0) in zip(chunks, starts_ends):
-            txt = _wrap_lines(chunk_text, int(SRT_MAX_CHARS_PER_LINE) or 999999)
-            if not txt.strip():
-                continue
+                subtitles.append(
+                    {
+                        "start": chunk_start,
+                        "end": chunk_end,
+                        "text": chunk,
+                    }
+                )
 
-            out_lines.append(str(idx))
-            out_lines.append(f"{seconds_to_srt_time(s0)} --> {seconds_to_srt_time(e0)}")
-            out_lines.append(txt)
-            out_lines.append("")
-            idx += 1
+    if not subtitles:
+        srt_path.write_text("", encoding="utf-8")
+        return
 
-    srt_path.write_text("\n".join(out_lines), encoding="utf-8")
+    # Sort by start time
+    subtitles.sort(key=lambda x: x["start"])
+
+    # Smart delay: if there's silence before a subtitle, start it slightly later
+    # This fixes "appearing too early" without breaking sync
+    for i, sub in enumerate(subtitles):
+        if i == 0:
+            # First subtitle - delay slightly if possible
+            sub["start"] = sub["start"] + 0.15
+        else:
+            # Check gap from previous subtitle
+            prev = subtitles[i - 1]
+            gap = sub["start"] - prev["end"]
+
+            # If there's a decent gap (> 0.5s), we can delay
+            if gap > 0.5:
+                # Push start later by up to 0.2s
+                delay = min(0.2, gap * 0.3)  # 30% of the gap, max 0.2s
+                new_start = sub["start"] + delay
+
+                # Make sure we don’t push into the next subtitle later in the loop
+                sub["start"] = new_start
+
+    # Fill gaps between subtitles (prevents flicker during pauses)
+    for i in range(len(subtitles) - 1):
+        current = subtitles[i]
+        next_sub = subtitles[i + 1]
+
+        gap = next_sub["start"] - current["end"]
+
+        if gap > 0 and gap < 3.0:
+            # Small gap - extend current to meet next
+            current["end"] = next_sub["start"]
+        elif gap < 0:
+            # Overlap - trim current
+            new_end = next_sub["start"]
+            if new_end - current["start"] >= 0.3:
+                current["end"] = new_end
+            else:
+                # Keep minimum duration even if it overlaps slightly
+                current["end"] = current["start"] + 0.3
+
+    # Generate SRT
+    max_line_chars = int(SRT_MAX_CHARS_PER_LINE)
+    lines = []
+
+    for idx, sub in enumerate(subtitles, start=1):
+        wrapped_text = _wrap_lines(sub["text"], max_line_chars)
+
+        lines.append(str(idx))
+        lines.append(
+            f"{seconds_to_srt_time(sub['start'])} --> {seconds_to_srt_time(sub['end'])}"
+        )
+        lines.append(wrapped_text)
+        lines.append("")
+
+    srt_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def run_whispercpp(
@@ -333,15 +373,10 @@ def run_whispercpp(
     best_of: int = 2,
     device: str | None = "0",
 ) -> WhisperPaths:
-    """
-    Pass 1: Whisper (timing source).
-    Runs whisper.cpp, writes JSON + TXT, then generates the timing SRT from JSON.
-    Outputs are written next to outbase using names like:
-      <outbase>.<whisper_tag>.json/.txt/.srt
-    """
+    """Run whisper.cpp and generate SRT."""
     out_prefix = str(outbase.parent / f"{outbase.name}.{whisper_tag}")
 
-    cmd: list[str] = [
+    cmd = [
         str(whisper_bin),
         "-m",
         str(whisper_model),
@@ -350,16 +385,15 @@ def run_whispercpp(
         "-l",
         "ja",
         "-t",
-        str(max(1, int(threads))),
+        str(max(1, threads)),
         "-bs",
-        str(max(1, int(beam_size))),
+        str(max(1, beam_size)),
         "-bo",
-        str(max(1, int(best_of))),
+        str(max(1, best_of)),
         "-mc",
         "3",
     ]
 
-    # GPU (optional)
     if device is not None:
         cmd += ["-dev", str(device), "-fa"]
 
@@ -368,18 +402,17 @@ def run_whispercpp(
     print("[subloom] whisper cmd:", " ".join(cmd))
     run(cmd, check=True)
 
-    json_path = Path(out_prefix + ".json")
-    txt_path = Path(out_prefix + ".txt")
-    srt_path = Path(out_prefix + ".srt")
+    json_path = Path(f"{out_prefix}.json")
+    txt_path = Path(f"{out_prefix}.txt")
+    srt_path = Path(f"{out_prefix}.srt")
 
     if not json_path.exists():
-        raise RuntimeError(f"Whisper JSON not found after run: {json_path}")
+        raise RuntimeError(f"Whisper JSON not found: {json_path}")
 
-    # generate SRT from JSON
     export_srt_from_whisper_json(json_path, srt_path, max_srt_line_dur)
 
     if not srt_path.exists():
-        raise RuntimeError(f"Whisper SRT not found after export: {srt_path}")
+        raise RuntimeError(f"Failed to generate SRT: {srt_path}")
 
     return WhisperPaths(
         json_path=json_path,

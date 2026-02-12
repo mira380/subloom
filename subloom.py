@@ -386,6 +386,28 @@ def main() -> None:
             default=0.0,
             help="Optional gain applied before filtering (example: 4.0 or -2.0).",
         )
+        # RNNoise (required; defaults are hard-set in settings.py)
+        p.add_argument(
+            "--rnnoise-mode",
+            choices=["fixed", "chunk"],
+            default="chunk",
+            help=argparse.SUPPRESS,
+        )
+        p.add_argument(
+            "--rnnoise-mix", type=float, default=0.51, help=argparse.SUPPRESS
+        )
+        p.add_argument(
+            "--rnnoise-chunk-s", type=float, default=20.0, help=argparse.SUPPRESS
+        )
+        p.add_argument(
+            "--rnnoise-mix-min", type=float, default=0.28, help=argparse.SUPPRESS
+        )
+        p.add_argument(
+            "--rnnoise-mix-max", type=float, default=0.80, help=argparse.SUPPRESS
+        )
+        p.add_argument(
+            "--rnnoise-frame-ms", type=int, default=30, help=argparse.SUPPRESS
+        )
 
         # Ollama
         p.add_argument(

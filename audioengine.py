@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Optional
 
 from merge_subs import run
-from settings import AUDIO_PRESETS, DEFAULT_AUDIO_PRESET, AUDIO_DEFAULTS
+from settings import (
+    AUDIO_PRESETS,
+    DEFAULT_AUDIO_PRESET,
+    AUDIO_DEFAULTS,
+    RNNOISE_MODE_DEFAULT,
+)
 
 
 # ------------------------------------------------------------
@@ -33,9 +38,23 @@ class AudioConfig:
 
     # RNNoise-style denoise via ffmpeg's arnndn filter
     use_rnnoise: bool = True
-    rnnoise_model: Optional[str] = (
-        ""  # path to model file
-)
+
+    # RNNoise model path is auto-resolved (and required) unless you explicitly pass one.
+    # You can override with: export SUBLOOM_RNNOISE_MODEL=/path/to/std.rnnn
+    rnnoise_model: Optional[str] = None
+
+    # fixed: single mix for whole file
+    # chunk: per-chunk adaptive mix (better for anime with BGM vs quiet dialogue tails)
+    rnnoise_mode: str = RNNOISE_MODE_DEFAULT  # fixed|chunk
+
+    # Used when rnnoise_mode == "fixed"
+    rnnoise_mix: float = 0.51
+
+    # Used when rnnoise_mode == "chunk"
+    rnnoise_chunk_s: float = 20.0
+    rnnoise_analysis_frame_ms: int = 30
+    rnnoise_mix_min: float = 0.28
+    rnnoise_mix_max: float = 0.80
 
 
 # ------------------------------------------------------------
@@ -58,6 +77,7 @@ def build_audio_filter(
     *,
     use_rnnoise: bool = False,
     rnnoise_model: Optional[str] = None,
+    rnnoise_mix: float = 0.51,
 ) -> str:
     p = (preset or DEFAULT_AUDIO_PRESET).strip().lower()
     chain = AUDIO_PRESETS.get(p, AUDIO_PRESETS[DEFAULT_AUDIO_PRESET])
@@ -69,9 +89,9 @@ def build_audio_filter(
     # RNNoise denoise first, then rest of chain
     if use_rnnoise:
         if rnnoise_model:
-            chain = f"arnndn=m='{rnnoise_model}':mix=0.55,{chain}"
+            chain = f"arnndn=m='{rnnoise_model}':mix={rnnoise_mix},{chain}"
         else:
-            chain = f"arnndn=mix=0.55,{chain}"
+            chain = f"arnndn=mix={rnnoise_mix},{chain}"
 
     return chain
 
@@ -288,6 +308,137 @@ def extract_audio_stable(input_path: Path, out_wav: Path, cfg: AudioConfig) -> P
     return out_wav
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _choose_chunk_mix_from_pcm16(
+    wav_path: Path, *, frame_ms: int, mix_min: float, mix_max: float
+) -> float:
+    """Very fast heuristic to choose RNNoise mix for a chunk.
+
+    Uses short-frame RMS variability:
+    - speech tends to have higher RMS variance (bursty)
+    - music/noise tends to be more constant
+
+    We push mix higher when energy is high *and* variability is low.
+    """
+    try:
+        import wave
+        import array
+
+        with wave.open(str(wav_path), "rb") as w:
+            n_channels = w.getnchannels()
+            sampwidth = w.getsampwidth()
+            fr = w.getframerate()
+            n_frames = w.getnframes()
+
+            if sampwidth != 2 or n_frames == 0:
+                return (mix_min + mix_max) / 2.0
+
+            raw = w.readframes(n_frames)
+        a = array.array("h")
+        a.frombytes(raw)
+
+        # mix down to mono in-place-ish
+        if n_channels == 2:
+            # take average of L/R (cheap)
+            mono = [(a[i] + a[i + 1]) // 2 for i in range(0, len(a) - 1, 2)]
+        else:
+            mono = a.tolist()
+
+        frame_n = max(1, int(fr * (frame_ms / 1000.0)))
+        rms_vals = []
+        # sample at most ~8 seconds worth of frames for speed
+        max_samples = min(len(mono), fr * 8)
+        step = frame_n
+        for s in range(0, max_samples, step):
+            chunk = mono[s : s + frame_n]
+            if not chunk:
+                break
+            # RMS
+            acc = 0.0
+            for v in chunk:
+                acc += float(v) * float(v)
+            rms = (acc / max(1, len(chunk))) ** 0.5
+            rms_vals.append(rms)
+
+        if not rms_vals:
+            return (mix_min + mix_max) / 2.0
+
+        mean = sum(rms_vals) / len(rms_vals)
+        var = sum((x - mean) ** 2 for x in rms_vals) / len(rms_vals)
+        std = var**0.5
+
+        # normalize mean roughly into [0,1] using int16 range
+        mean_norm = _clamp(mean / 12000.0, 0.0, 1.0)
+        # coefficient of variation, clipped
+        cv = _clamp(std / (mean + 1e-6), 0.0, 2.0)
+        cv_norm = _clamp(cv / 1.2, 0.0, 1.0)
+
+        # Higher when energy high and variability low
+        score = _clamp(mean_norm * (1.0 - cv_norm), 0.0, 1.0)
+
+        return mix_min + score * (mix_max - mix_min)
+    except Exception:
+        return (mix_min + mix_max) / 2.0
+
+
+def _segment_wav(input_wav: Path, seg_dir: Path, chunk_s: float) -> list[Path]:
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    pattern = seg_dir / "chunk_%05d.wav"
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_wav),
+        "-f",
+        "segment",
+        "-segment_time",
+        f"{chunk_s}",
+        "-reset_timestamps",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(pattern),
+    ]
+    run(cmd, check=True)
+    return sorted(seg_dir.glob("chunk_*.wav"))
+
+
+def _concat_wavs(wavs: list[Path], out_wav: Path) -> None:
+    if not wavs:
+        raise RuntimeError("No chunks to concatenate.")
+    lst = out_wav.with_suffix(".concat.txt")
+    lst.write_text(
+        "\n".join([f"file '{p.as_posix()}'" for p in wavs]) + "\n", encoding="utf-8"
+    )
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(lst),
+        "-c",
+        "copy",
+        str(out_wav),
+    ]
+    run(cmd, check=True)
+    try:
+        lst.unlink()
+    except Exception:
+        pass
+
+
 def extract_and_clean_audio(
     input_path: Path,
     out_wav: Path,
@@ -302,31 +453,116 @@ def extract_and_clean_audio(
 
     clean_wav = out_wav.with_name(out_wav.stem + ".clean.wav")
 
+    # RNNoise is a requirement (quality backbone) if enabled.
     use_rn = bool(cfg.use_rnnoise) and ffmpeg_has_filter("arnndn")
-    af = build_audio_filter(
-        cfg.preset,
-        cfg.gain_db,
-        use_rnnoise=use_rn,
-        rnnoise_model=cfg.rnnoise_model,
-    )
+    if cfg.use_rnnoise and not use_rn:
+        raise RuntimeError(
+            "ffmpeg filter 'arnndn' not available, but RNNoise is enabled/required."
+        )
 
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        str(raw_wav),
-        "-af",
-        af,
-        "-ac",
-        str(cfg.target_ch),
-        "-ar",
-        str(cfg.target_sr),
-        str(clean_wav),
-    ]
-    run(cmd, check=True)
+    rn_model = cfg.rnnoise_model
+    if use_rn and not rn_model:
+        # auto-resolve from settings (required)
+        from settings import resolve_rnnoise_model
+
+        rn_model = str(resolve_rnnoise_model())
+
+    # Chunk-adaptive RNNoise (per-chunk mix), then apply the rest of the chain.
+    if use_rn and (cfg.rnnoise_mode or "").strip().lower() == "chunk":
+        seg_dir = out_wav.with_suffix("").with_name(out_wav.stem + ".rnnoise_chunks")
+        den_dir = out_wav.with_suffix("").with_name(out_wav.stem + ".rnnoise_denoised")
+        try:
+            chunks = _segment_wav(raw_wav, seg_dir, cfg.rnnoise_chunk_s)
+            if not chunks:
+                raise RuntimeError("RNNoise chunking produced no chunks.")
+
+            denoised: list[Path] = []
+            for ch in chunks:
+                mix = _choose_chunk_mix_from_pcm16(
+                    ch,
+                    frame_ms=cfg.rnnoise_analysis_frame_ms,
+                    mix_min=cfg.rnnoise_mix_min,
+                    mix_max=cfg.rnnoise_mix_max,
+                )
+                den_dir.mkdir(parents=True, exist_ok=True)
+                out_ch = den_dir / ch.name
+                af_rn = f"arnndn=m='{rn_model}':mix={mix}"
+                cmd_rn = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(ch),
+                    "-af",
+                    af_rn,
+                    "-ac",
+                    str(cfg.target_ch),
+                    "-ar",
+                    str(cfg.target_sr),
+                    str(out_ch),
+                ]
+                run(cmd_rn, check=True)
+                denoised.append(out_ch)
+
+            pre_wav = out_wav.with_name(out_wav.stem + ".rnnoise.wav")
+            _concat_wavs(denoised, pre_wav)
+
+            # Now run your normal preset chain (WITHOUT arnndn) on the rnnoise output.
+            af = build_audio_filter(
+                cfg.preset,
+                cfg.gain_db,
+                use_rnnoise=False,
+                rnnoise_model=None,
+                rnnoise_mix=cfg.rnnoise_mix,
+            )
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(pre_wav),
+                "-af",
+                af,
+                "-ac",
+                str(cfg.target_ch),
+                "-ar",
+                str(cfg.target_sr),
+                str(clean_wav),
+            ]
+            run(cmd, check=True)
+        finally:
+            # keep chunk dirs only if you want to debug
+            pass
+    else:
+        af = build_audio_filter(
+            cfg.preset,
+            cfg.gain_db,
+            use_rnnoise=use_rn,
+            rnnoise_model=rn_model,
+            rnnoise_mix=cfg.rnnoise_mix,
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(raw_wav),
+            "-af",
+            af,
+            "-ac",
+            str(cfg.target_ch),
+            "-ar",
+            str(cfg.target_sr),
+            str(clean_wav),
+        ]
+        run(cmd, check=True)
 
     if out_wav_stereo:
         cmd_stereo = [
